@@ -258,6 +258,13 @@ class ScheduleRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class CommitmentIssueRequest(ScheduleRequest):
+    """择时通行承诺签发请求：相对秒数轨迹（首点 t=0、严格递增）+ 带时区候选窗口。
+
+    字段与 /api/schedule 相同；窗口起点必须晚于签发时刻（服务端写锁时刻）。
+    """
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -377,6 +384,37 @@ class PassOut(_UTCDatetimeModel):
     status: str
     revision: int
     trajectory: list[PassPointOut]
+    issued_at: datetime
+    cancelled_at: datetime | None
+
+
+class CommitmentPointOut(BaseModel):
+    """承诺轨迹点：相对首点的秒数（首点恒为 0），非时刻。"""
+
+    x: float
+    y: float
+    t: float
+
+
+class CommitmentOut(_UTCDatetimeModel):
+    """择时通行承诺：签发/查询/取消的统一响应。
+
+    * revision：签发时计算安全区间所用的区域集合版本号；
+    * interval_revision：本次 intervals 计算所用的当前区域集合版本号
+      （签发响应中与 revision 相同）；
+    * intervals：签发时为候选窗口内的全部安全出发区间（左闭右开）；
+      查询/取消时为当前时刻之后仍可用的安全出发区间（窗口已结束或已取消后
+      重算为空时返回 []）。
+    """
+
+    id: int
+    status: str
+    revision: int
+    interval_revision: int
+    trajectory: list[CommitmentPointOut]
+    window_start: datetime
+    window_end: datetime
+    intervals: list[DepartureIntervalOut]
     issued_at: datetime
     cancelled_at: datetime | None
 

@@ -459,8 +459,11 @@ def safe_departure_intervals(
                 "start_inclusive": True,
                 "end_inclusive": False,
             })
-        if hi > cursor:
-            cursor = hi
+        # 游标必须推进到该禁止区间的右端（被窗口右端截断时直接结束）；
+        # 否则禁止区间远在游标之前时 hi 不会大于 cursor，尾部安全段会丢失
+        cursor = min(hi, window_end)
+        if cursor >= window_end - EPS:
+            break
 
     # 禁止区间可能远跨过窗口右端：尾部安全段是否存在由游标位置统一决定
     if cursor < window_end - EPS:

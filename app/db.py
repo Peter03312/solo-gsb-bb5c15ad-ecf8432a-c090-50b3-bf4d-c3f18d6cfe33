@@ -70,6 +70,28 @@ CREATE TABLE IF NOT EXISTS passes (
 CREATE INDEX IF NOT EXISTS idx_passes_constraining
     ON passes (status, end_time);
 
+-- 择时通行承诺：安全员以相对秒数轨迹 + 带时区候选出发窗口申请；签发时按
+-- 当前完整区域集合求出左闭右开的安全出发区间（为空则拒签不落库）。
+-- 未取消且窗口未结束（window_end 在当前时刻之后）的承诺约束后续所有区域
+-- 写入（登记/修订/删除/批量变更）：变更前仍有未来安全出发时刻而变更后
+-- 消失时，整笔变更回滚
+CREATE TABLE IF NOT EXISTS commitments (
+    id              BIGSERIAL PRIMARY KEY,
+    -- 相对秒数轨迹：[{"x": .., "y": .., "t": <相对首点秒数，首点为 0>}, ...]
+    trajectory      JSONB NOT NULL,
+    window_start    TIMESTAMPTZ NOT NULL,
+    window_end      TIMESTAMPTZ NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    issued_revision BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ,
+    CONSTRAINT commitments_status_check CHECK (status IN ('active', 'cancelled')),
+    CONSTRAINT commitments_window_order CHECK (window_start < window_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_commitments_constraining
+    ON commitments (status, window_end);
+
 -- 幂等键：区域写操作（登记/修订/删除/批量变更）的网络超时安全重试。
 -- 占位行与业务变更、响应回填在同一事务提交，因此已提交的行必然带有
 -- 完整的原 HTTP 状态码与响应体；业务失败回滚时占位行一并消失（不占键）

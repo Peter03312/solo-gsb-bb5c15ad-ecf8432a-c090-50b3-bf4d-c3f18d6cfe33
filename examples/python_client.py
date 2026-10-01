@@ -176,6 +176,56 @@ def main() -> None:
     show("取消后原冲突区域可登记", created)
     call("DELETE", f"/api/regions/{created['region']['id']}")
 
+    # ---- 择时通行承诺：相对秒数轨迹 + 候选出发窗口 ----
+    # 区域只在未来窗口中段生效，窗口内存在两段安全出发时刻
+    now = datetime.now(timezone.utc)
+    ws = now + timedelta(hours=1)
+    we = now + timedelta(hours=3)
+    vf = ws + timedelta(seconds=44 * 60 + 15)
+    vt = ws + timedelta(hours=1, minutes=30, seconds=15)
+    middle = call("POST", "/api/regions", {
+        "name": "择时-中段生效区",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": vf.isoformat(),
+        "valid_to": vt.isoformat(),
+    })
+    commitment = call("POST", "/api/commitments", {
+        "points": [
+            {"x": -50, "y": 50, "t": 0},
+            {"x": 150, "y": 50, "t": 60},
+        ],
+        "window_start": ws.isoformat(),
+        "window_end": we.isoformat(),
+    })
+    show("签发择时通行承诺（返回安全出发区间）", commitment)
+    commitment_id = commitment["id"]
+    for iv in commitment["intervals"]:
+        print(f"  可出发：[{iv['start']}, {iv['end']})")
+
+    # 查询当前可用区间（随区域集合实时重算）
+    show("查询承诺当前可用区间", call("GET", f"/api/commitments/{commitment_id}"))
+
+    # 承诺未取消且窗口未结束：使其丧失全部未来安全时刻的变更被 409 整笔回滚
+    try:
+        call("PATCH", f"/api/regions/{middle['region']['id']}", {
+            "valid_from": "2020-01-01T00:00:00Z",
+            "valid_to": "2030-01-01T00:00:00Z",
+        })
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("承诺约束生效：409 commitment_conflict", err)
+        print(f"  冲突承诺 id：{[d['commitment_id'] for d in err['error']['details']]}")
+
+    # 取消（幂等）；取消后修订放行
+    show("取消承诺", call("POST", f"/api/commitments/{commitment_id}/cancel"))
+    show("重复取消（status/cancelled_at 不变）",
+         call("POST", f"/api/commitments/{commitment_id}/cancel"))
+    show("取消后修订放行", call("PATCH", f"/api/regions/{middle['region']['id']}", {
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": "2030-01-01T00:00:00Z",
+    }))
+    call("DELETE", f"/api/regions/{middle['region']['id']}")
+
 
 if __name__ == "__main__":
     main()
