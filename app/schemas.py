@@ -258,6 +258,25 @@ class ScheduleRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class CommitmentIssueRequest(BaseModel):
+    """择时通行承诺签发请求：相对秒数固定行程 + 带时区候选出发窗口。
+
+    轨迹与窗口语义与 /api/schedule 相同（首点相对秒数为 0、其余严格递增；
+    窗口左闭右开），且窗口起点必须晚于签发时刻。
+    """
+
+    points: list[RelativePointIn] = Field(min_length=2)
+    window_start: datetime = Field(description="候选出发窗口起点（含，带时区），须晚于签发时刻")
+    window_end: datetime = Field(description="候选出发窗口终点（不含，带时区）")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("window_start", "window_end")
+    @classmethod
+    def _check_time(cls, v: datetime, info):
+        return _require_utc(v, info.field_name)
+
+
 # ---------------------------------------------------------------- 响应模型
 
 def _iso_z(dt: datetime) -> str:
@@ -319,6 +338,26 @@ class ScheduleResponse(_UTCDatetimeModel):
     window_start: datetime
     window_end: datetime
     intervals: list[DepartureIntervalOut]
+
+
+class CommitmentOut(_UTCDatetimeModel):
+    """择时通行承诺：签发/查询/取消的统一响应。
+
+    status: active（未取消）/ cancelled（已取消）；
+    revision 为签发时核验所用的区域集合版本号。
+    intervals 为「当前时刻」视角的安全出发区间（相对 now 裁剪后的
+    左闭右开区间）；取消承诺时 intervals 恒为空（承诺已失效）。
+    """
+
+    id: int
+    status: str
+    revision: int
+    trajectory: list[RelativePointIn]
+    window_start: datetime
+    window_end: datetime
+    intervals: list[DepartureIntervalOut]
+    issued_at: datetime
+    cancelled_at: datetime | None
 
 
 class RegionCreatedResponse(_UTCDatetimeModel):

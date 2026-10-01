@@ -176,6 +176,61 @@ def main() -> None:
     show("取消后原冲突区域可登记", created)
     call("DELETE", f"/api/regions/{created['region']['id']}")
 
+    # ---- 择时通行承诺：相对秒数固定行程 + 带时区候选出发窗口 ----
+    # 先登记一个短时生效区域，使禁止出发区间只覆盖候选窗口中段
+    t_win = datetime.now(timezone.utc) + timedelta(seconds=600)
+    commit_region = call("POST", "/api/regions", {
+        "name": "承诺演示-一分钟",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": (t_win + timedelta(seconds=90)).isoformat(),
+        "valid_to": (t_win + timedelta(seconds=150)).isoformat(),
+    })
+    # 固定行程 (-50,50) t=0 → (150,50) t=60，几何接触为相对 [15,45]；
+    # 禁止出发区间 [vf-45s, vt-15s) 落在窗口内，把窗口切成两段安全区间
+    issued_commit = call("POST", "/api/commitments", {
+        "points": [
+            {"x": -50, "y": 50, "t": 0},
+            {"x": 150, "y": 50, "t": 60},
+        ],
+        "window_start": t_win.isoformat(),
+        "window_end": (t_win + timedelta(seconds=300)).isoformat(),
+    })
+    show("签发择时通行承诺（两段当前可用安全区间）", issued_commit)
+    commitment_id = issued_commit["id"]
+    for iv in issued_commit["intervals"]:
+        lb = "[" if iv["start_inclusive"] else "("
+        rb = "]" if iv["end_inclusive"] else ")"
+        print(f"  可出发：{lb}{iv['start']}, {iv['end']}{rb}")
+
+    show("查询承诺当前可用区间", call("GET", f"/api/commitments/{commitment_id}"))
+
+    # 未取消且窗口未结束的承诺约束区域变更：抹掉全部未来安全时刻会被 409 拒绝
+    try:
+        call("POST", "/api/regions", {
+            "name": "承诺演示-全时段",
+            "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+            "valid_from": "2020-01-01T00:00:00Z",
+            "valid_to": "2032-01-01T00:00:00Z",
+        })
+    except urllib.error.HTTPError as exc:
+        err = json.loads(exc.read().decode())
+        show("承诺约束生效：409 commitment_conflict", err)
+        print(f"  冲突承诺 id：{[d['commitment_id'] for d in err['error']['details']]}")
+
+    # 取消（幂等）；取消后该区域即可登记
+    show("取消承诺", call("POST", f"/api/commitments/{commitment_id}/cancel"))
+    show("重复取消（结果不变）", call("POST", f"/api/commitments/{commitment_id}/cancel"))
+    unblocked = call("POST", "/api/regions", {
+        "name": "承诺演示-全时段",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "valid_from": "2020-01-01T00:00:00Z",
+        "valid_to": "2032-01-01T00:00:00Z",
+    })
+    show("取消后原冲突区域可登记", unblocked)
+    # 清理本演示产生的区域
+    call("DELETE", f"/api/regions/{commit_region['region']['id']}")
+    call("DELETE", f"/api/regions/{unblocked['region']['id']}")
+
 
 if __name__ == "__main__":
     main()

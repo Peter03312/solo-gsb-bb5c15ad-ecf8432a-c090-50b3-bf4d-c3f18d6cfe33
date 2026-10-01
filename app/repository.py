@@ -84,6 +84,21 @@ class PassConflict(Exception):
         self.pass_ids = pass_ids
 
 
+class CommitmentUnsafe(Exception):
+    """候选窗口内当前不存在任何安全出发时刻；承诺拒签且不落库。"""
+
+
+class CommitmentConflict(Exception):
+    """区域变更将抹去承诺在窗口结束前的全部安全出发时刻；携带冲突承诺 id。"""
+
+    def __init__(self, commitment_ids: list[int]):
+        super().__init__(
+            f"变更后区域集合与 {len(commitment_ids)} 张未取消择时通行承诺冲突，"
+            "其窗口结束前将不再有任何安全出发时刻，整笔变更已回滚"
+        )
+        self.commitment_ids = commitment_ids
+
+
 class IdempotencyKeyConflict(Exception):
     """同一幂等键被内容不同的请求复用（操作类型/目标区域/请求内容不一致）。"""
 
@@ -141,10 +156,14 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
     wkt = wkt_dumps(Polygon(polygon_vertices), rounding_precision=-1)
     # 锁定元数据行，使区域写入串行化并拿到稳定的新版本号
     get_revision(cur)
-    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全
-    candidate = [
+    # 当前完整集合（行锁在 meta 行上，期间不存在任何并发写）；
+    # 变更前集合用于判定承诺「原本有、变更后没有」的破坏语义
+    current_regions = [
         _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
     ]
+    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全、
+    # 且不得抹去未结束承诺窗口内的全部安全出发时刻
+    candidate = list(current_regions)
     candidate.append({
         "id": 0,  # 新区域尚未分配 id；核验只使用几何与生效时段
         "name": payload.name,
@@ -152,7 +171,9 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
         "valid_to": _epoch(payload.valid_to),
         "polygon": Polygon(polygon_vertices),
     })
-    check_passes_safe(cur, candidate, utcnow())
+    now = utcnow()
+    check_passes_safe(cur, candidate, now)
+    check_commitments_safe(cur, current_regions, candidate, now)
     cur.execute(
         """
         INSERT INTO regions (name, valid_from, valid_to, polygon, wkt)
@@ -221,8 +242,12 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
         polygon_json = row["polygon"]
         wkt = row["wkt"]
 
-    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全
+    # 变更后的完整集合必须仍保证未取消且未结束的凭证安全，
+    # 且不得抹去未结束承诺窗口内的全部安全出发时刻
     current = _load_all_regions_locked(cur)
+    current_regions = [
+        _region_row_to_geom(current[rid]) for rid in sorted(current)
+    ]
     candidate = []
     for rid in sorted(current):
         if rid == region_id:
@@ -235,7 +260,9 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
             })
         else:
             candidate.append(_region_row_to_geom(current[rid]))
-    check_passes_safe(cur, candidate, utcnow())
+    now = utcnow()
+    check_passes_safe(cur, candidate, now)
+    check_commitments_safe(cur, current_regions, candidate, now)
 
     cur.execute(
         """
@@ -278,13 +305,16 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
     existing = cur.fetchone()
     if existing is None:
         return False, None
-    # 变更后的完整集合（移除该区域）必须仍保证未取消且未结束的凭证安全
-    candidate = [
+    # 变更后的完整集合（移除该区域）必须仍保证未取消且未结束的凭证安全；
+    # 删除只会扩大安全集合，承诺不可能被破坏，但仍沿用同一检查契约
+    current_regions = [
         _region_row_to_geom(r)
         for rid, r in _load_all_regions_locked(cur).items()
         if rid != region_id
     ]
-    check_passes_safe(cur, candidate, utcnow())
+    now = utcnow()
+    check_passes_safe(cur, current_regions, now)
+    check_commitments_safe(cur, current_regions, current_regions, now)
     cur.execute("DELETE FROM regions WHERE id = %s", (region_id,))
     revision = bump_revision(cur)
     return True, revision
@@ -540,8 +570,13 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
         raise BatchUnsafeTrajectories(all_checks)
 
     # 6.5) 未取消且末点时刻未过的凭证，其轨迹在变更后完整集合下仍须安全；
-    #      任一冲突则整批回滚（409 pass_conflict），version/revision 不变
-    check_passes_safe(cur, candidate, utcnow())
+    #      任一冲突则整批回滚（409 pass_conflict），version/revision 不变。
+    #      未取消且窗口未结束的择时承诺同样约束本批：仅当变更前窗口内仍有
+    #      未来安全时刻、变更后一点不剩时才冲突（409 commitment_conflict）
+    before_regions = [_region_row_to_geom(current[rid]) for rid in sorted(current)]
+    now = utcnow()
+    check_passes_safe(cur, candidate, now)
+    check_commitments_safe(cur, before_regions, candidate, now)
 
     # 7) 全部轨迹安全：按操作顺序落库
     for op in op_results:
@@ -722,6 +757,191 @@ def cancel_pass(cur, pass_id: int) -> dict | None:
             RETURNING id, trajectory, status, issued_revision, created_at, cancelled_at
             """,
             (pass_id,),
+        )
+        row = cur.fetchone()
+    return row
+
+
+# ---------------------------------------------------------------- 择时通行承诺
+
+def commitment_safe_intervals(
+    traj: list[tuple[float, float, float]],
+    regions: list[dict],
+    window_start: float,
+    window_end: float,
+    now_epoch: float,
+) -> list[dict]:
+    """承诺视角的安全出发区间：候选窗口内、当前时刻之后的左闭右开区间。
+
+    复用 /api/schedule 的精确区间运算；有效候选窗口取
+    [max(window_start, now), window_end)——起点早于当前时刻的窗口部分已
+    无法再承诺，以 now 为闭端裁剪（now 为单个零测度时刻，且每次查询/校验
+    都以当时的 now 重算）。窗口已结束或已无可行时刻时返回 []。
+    """
+    effective_start = max(window_start, now_epoch)
+    if effective_start >= window_end:
+        return []
+    return geometry.safe_departure_intervals(
+        traj, regions, effective_start, window_end
+    )
+
+
+def _load_constraining_commitments(cur, now: datetime) -> list[dict]:
+    """未取消且候选窗口未结束（window_end 晚于当前时刻）的承诺。
+
+    调用方应已持有 region_meta 行锁：签发/取消与所有区域写入在此串行化，
+    锁内读到的是稳定集合。
+    """
+    cur.execute(
+        """
+        SELECT id, trajectory, window_start, window_end
+        FROM commitments
+        WHERE status = 'active' AND window_end > %s
+        ORDER BY id
+        """,
+        (now,),
+    )
+    commitments = []
+    for row in cur.fetchall():
+        traj = [
+            (float(p["t"]), float(p["x"]), float(p["y"]))
+            for p in row["trajectory"]
+        ]
+        commitments.append({
+            "id": row["id"],
+            "trajectory": traj,
+            "window_start": _epoch(row["window_start"]),
+            "window_end": _epoch(row["window_end"]),
+        })
+    return commitments
+
+
+def check_commitments_safe(
+    cur,
+    regions_before: list[dict],
+    regions_after: list[dict],
+    now: datetime,
+) -> None:
+    """区域变更不得抹去承诺窗口内剩余的全部安全出发时刻。
+
+    对每张未取消且窗口未结束的承诺，分别用变更前、变更后的完整区域集合
+    重算「当前时刻之后」的安全出发区间（同一 now，同一写事务内）：
+    变更前仍有未来安全时刻、变更后一点不剩时，该承诺冲突；
+    变更前已无未来安全时刻的承诺不再约束（窗口虽未结束，但已无可保护之物）。
+    任一冲突即抛 CommitmentConflict，调用方应回滚整笔变更。
+    """
+    now_epoch = now.timestamp()
+    conflicts: list[int] = []
+    for c in _load_constraining_commitments(cur, now):
+        before = commitment_safe_intervals(
+            c["trajectory"], regions_before,
+            c["window_start"], c["window_end"], now_epoch,
+        )
+        if not before:
+            # 变更前已无未来安全时刻：本笔变更不再破坏任何东西
+            continue
+        after = commitment_safe_intervals(
+            c["trajectory"], regions_after,
+            c["window_start"], c["window_end"], now_epoch,
+        )
+        if not after:
+            conflicts.append(c["id"])
+    if conflicts:
+        raise CommitmentConflict(conflicts)
+
+
+def issue_commitment(
+    cur,
+    traj: list[tuple[float, float, float]],
+    window_start: datetime,
+    window_end: datetime,
+) -> dict:
+    """签发择时通行承诺：在持有 meta 行锁的事务内核验并持久化。
+
+    traj: [(t_seconds, x, y), ...]，已校验（≥2 点、首点 t=0、严格递增）。
+    窗口起点必须晚于签发时刻（拿到写锁后的当前服务时间），否则
+    TrajectoryError；按当前完整区域集合计算左闭右开的安全出发区间，
+    区间为空则抛 CommitmentUnsafe，拒签且不落库。
+    返回含初始安全区间（epoch 秒）的 dict。
+    """
+    # 锁全局元数据行：与取消、所有区域写入串行化，核验与落库之间无人插队
+    revision = get_revision(cur)
+    now = utcnow()
+    if window_start <= now:
+        raise geometry.TrajectoryError(
+            "候选出发窗口起点必须晚于签发时刻（当前服务时间），"
+            "已开始或正在开始的窗口不予签发承诺"
+        )
+    regions = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    intervals = geometry.safe_departure_intervals(
+        traj, regions, _epoch(window_start), _epoch(window_end)
+    )
+    if not intervals:
+        raise CommitmentUnsafe()
+    cur.execute(
+        """
+        INSERT INTO commitments
+            (trajectory, window_start, window_end, status, issued_revision)
+        VALUES (%(trajectory)s::jsonb, %(window_start)s, %(window_end)s,
+                'active', %(revision)s)
+        RETURNING id, trajectory, window_start, window_end, status,
+                  issued_revision, created_at, cancelled_at
+        """,
+        {
+            "trajectory": json.dumps(
+                [{"x": x, "y": y, "t": t} for t, x, y in traj]
+            ),
+            "window_start": window_start,
+            "window_end": window_end,
+            "revision": revision,
+        },
+    )
+    row = cur.fetchone()
+    row["intervals"] = intervals
+    return row
+
+
+def get_commitment(cur, commitment_id: int) -> dict | None:
+    cur.execute(
+        """
+        SELECT id, trajectory, window_start, window_end, status,
+               issued_revision, created_at, cancelled_at
+        FROM commitments WHERE id = %s
+        """,
+        (commitment_id,),
+    )
+    return cur.fetchone()
+
+
+def cancel_commitment(cur, commitment_id: int) -> dict | None:
+    """取消承诺；重复取消幂等（已取消的直接返回现状）。未找到返回 None。
+
+    与签发、所有区域写入在同一把 meta 行锁上串行化。
+    """
+    get_revision(cur)
+    cur.execute(
+        """
+        SELECT id, trajectory, window_start, window_end, status,
+               issued_revision, created_at, cancelled_at
+        FROM commitments WHERE id = %s
+        FOR UPDATE
+        """,
+        (commitment_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] == "active":
+        cur.execute(
+            """
+            UPDATE commitments SET status = 'cancelled', cancelled_at = now()
+            WHERE id = %s
+            RETURNING id, trajectory, window_start, window_end, status,
+                      issued_revision, created_at, cancelled_at
+            """,
+            (commitment_id,),
         )
         row = cur.fetchone()
     return row

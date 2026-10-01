@@ -9,6 +9,10 @@
 区域变更，任何会使其轨迹不再安全的登记/修订/删除/批量变更都会被整体拒绝。
 区域写操作（登记/修订/删除/批量变更）支持携带 **`Idempotency-Key` 幂等键**：
 网络超时后安全重试同一请求，不会重复登记、重复推进版本或重复分配区域 ID。
+安全员还可以为**相对秒数固定行程**与**带时区候选出发窗口申请择时通行
+承诺**：签发时给出当前左闭右开的安全出发区间；未取消且窗口未结束的承诺
+会约束后续一切区域变更——变更前窗口内仍有未来安全时刻、变更后一点不剩的
+登记/修订/删除/批量变更都会被整体拒绝（409）。
 
 ## 核验规则
 
@@ -63,6 +67,7 @@
 | 422 | `invalid_operation` | 单条操作语义非法（如修订后 `valid_from >= valid_to`），带操作下标 |
 | 422 | `unsafe_trajectory` | 存在轨迹在变更后集合下穿越；details 列出轨迹下标与穿越起止明细 |
 | 409 | `pass_conflict` | 变更后集合将使未取消且未结束的凭证不安全；details 列出冲突凭证 id |
+| 409 | `commitment_conflict` | 变更后集合将抹掉未取消且窗口未结束承诺的全部未来安全出发时刻；details 列出冲突承诺 id |
 | 422 | `validation_error` / `invalid_polygon` / `invalid_trajectory` | 结构/多边形/轨迹非法（同既有接口） |
 
 ## 通行凭证规则（签发 / 查询 / 取消）
@@ -94,6 +99,67 @@
   全局 `revision` 均不变。已取消或末点时刻已过的凭证不再约束。
 * **串行化**：签发、取消与所有区域写入（含批量）共用同一把全局元数据行锁，
   完全串行化——不存在"核验通过到落库之间被并发变更插队"的漏检窗口。
+
+## 择时通行承诺规则（签发 / 查询 / 取消）
+
+安全员手里只有一条**固定行程**（相对首点的秒数轨迹）与一个未来的**候选
+出发窗口**时，可以申请择时通行承诺：系统按当前完整区域集合算出窗口内
+左闭右开的安全出发区间并持久化；只要承诺未取消、窗口未结束，后续任何会
+**抹掉其全部未来安全出发时刻**的区域变更都会被整体拒绝。
+
+* **签发 `POST /api/commitments`**：请求体为相对秒数轨迹
+  `points`（首点 `t` 必须为 `0`、其余严格递增，语义与 `/api/schedule`
+  相同）加带时区候选出发窗口 `window_start` / `window_end`（左闭右开，
+  服务端归一化为 UTC）；**窗口起点必须晚于签发时刻**（以服务端拿到写锁
+  后的当前时间为准）。签发在持有全局元数据行锁的写事务内完成，按
+  **当前完整区域集合**用与 `/api/schedule` 完全相同的精确区间运算
+  （接触 `[a,b]` 闭、生效 `[vf,vt)` 左闭右开 → 禁止出发 `[vf-b, vt-a)`）
+  求窗口内的安全出发区间：
+  * 存在安全区间：持久化并返回 **201**，响应含承诺 `id`、`status`、
+    `revision`（签发时所用区域集合版本）、相对秒数轨迹、候选窗口、
+    当前 `intervals`（左闭右开安全区间）与 `issued_at`；签发不推进
+    区域 revision；
+  * 区间为空：**422** `unsafe_trajectory`，**拒签且不保存**；
+  * 轨迹/窗口非法（点数不足、坐标或相对时刻非有限、首点非 0、相对时刻
+    不严格递增、窗口倒序、窗口不带时区）或窗口起点不晚于当前时刻：
+    **422** `invalid_trajectory` / `invalid_input` / `validation_error`，
+    不落库。
+* **查询 `GET /api/commitments/{id}`**：返回承诺及其**当前可用**安全
+  区间——按查询时刻的完整区域集合与当前时刻重算（早于当前时刻的窗口
+  部分不再出现；窗口已结束时区间为空）；`status` 仍为 `active/cancelled`，
+  `revision` 仍是签发时版本。已取消承诺的 `intervals` 恒为空。
+  未知 ID 返回 **404** `not_found`。
+* **取消 `POST /api/commitments/{id}/cancel`**：置为 `cancelled` 并返回
+  承诺状态（`intervals` 恒为空）；**重复取消幂等**（结果不变，仍 200）；
+  未知 ID 返回 **404**。取消不推进区域 revision，取消后承诺不再约束
+  任何区域变更。
+* **承诺约束区域变更**：**未取消且窗口未结束**（`window_end` 晚于当前
+  时刻）的承诺，在单区登记、修订、删除及批量变更**提交前**都会在
+  **同一写事务**内用**变更后集合**重算当前时刻之后的安全区间：
+  * 变更前窗口内**仍有未来安全时刻**、变更后**一点不剩** → 返回
+    **409** `commitment_conflict`（details 逐条列出冲突承诺
+    `commitment_id`），**整笔回滚**，区域 `version` 与全局 `revision`
+    均不变；
+  * 变更前已无未来安全时刻（例如窗口大部分时间已流逝且剩余部分全被
+    禁止）的承诺**不再约束**；
+  * 只挡住窗口一部分、仍留有安全时刻的变更正常放行，下次查询即可看到
+    收缩后的区间。
+  * 该检查与通行凭证保护 `pass_conflict` 并列：任一检查失败都整笔回滚。
+* **串行化**：承诺签发、取消与签发凭证、所有区域写入（含批量）共用同一把
+  全局元数据行锁，完全串行化——不存在"区间算好到落库之间被并发变更
+  插队"的漏检窗口。
+
+```bash
+# 签发：固定行程 + 未来候选窗口，返回当前安全出发区间
+curl -X POST http://localhost:8000/api/commitments \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"x":-50,"y":50,"t":0},{"x":150,"y":50,"t":60}],
+       "window_start":"2026-10-01T12:10:00Z",
+       "window_end":"2026-10-01T12:15:00Z"}'
+# 查询当前可用区间 / 幂等取消
+curl http://localhost:8000/api/commitments/1
+curl -X POST http://localhost:8000/api/commitments/1/cancel
+```
 
 ## 幂等重试规则（`Idempotency-Key` 请求头）
 
@@ -184,8 +250,8 @@ docker compose up --build
 | http://localhost:8000/health | 健康检查 |
 | PostgreSQL | localhost:5432（用户/库/密码均为 restrict） |
 
-首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、`idempotency_keys`）
-并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
+首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、
+`commitments`、`idempotency_keys`）并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
 （默认 30 次、间隔 1 秒）。
 
 停止并清理数据卷：
@@ -236,6 +302,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/passes` | 为一条绝对时刻轨迹签发可取消的通行凭证（201） |
 | GET | `/api/passes/{id}` | 按 ID 查询凭证（含状态） |
 | POST | `/api/passes/{id}/cancel` | 取消凭证（幂等），返回状态 |
+| POST | `/api/commitments` | 为相对秒数固定行程+候选窗口签发择时通行承诺（201） |
+| GET | `/api/commitments/{id}` | 按 ID 查询承诺与当前可用安全出发区间 |
+| POST | `/api/commitments/{id}/cancel` | 取消承诺（幂等），返回状态 |
 
 登记示例：
 
@@ -484,6 +553,80 @@ curl -X POST http://localhost:8000/api/passes/1/cancel   # 取消，幂等
 }
 ```
 
+### 择时通行承诺 `POST /api/commitments`
+
+为相对秒数固定行程与带时区候选出发窗口签发承诺。请求与 `/api/schedule`
+相同（首点相对秒数为 `0`、其余严格递增），另要求**窗口起点晚于签发时刻**：
+
+```json
+{
+  "points": [
+    {"x": -50, "y": 50, "t": 0},
+    {"x": 150, "y": 50, "t": 60}
+  ],
+  "window_start": "2026-10-01T12:10:00Z",
+  "window_end":   "2026-10-01T12:15:00Z"
+}
+```
+
+安全（窗口内存在安全出发时刻）时返回 **201**，`intervals` 为按当前完整
+区域集合算出的左闭右开安全出发区间（结构与 `/api/schedule` 一致）：
+
+```json
+{
+  "id": 1,
+  "status": "active",
+  "revision": 3,
+  "trajectory": [
+    {"x": -50.0, "y": 50.0, "t": 0.0},
+    {"x": 150.0, "y": 50.0, "t": 60.0}
+  ],
+  "window_start": "2026-10-01T12:10:00Z",
+  "window_end":   "2026-10-01T12:15:00Z",
+  "intervals": [
+    {
+      "start": "2026-10-01T12:10:00Z",
+      "end":   "2026-10-01T12:12:30Z",
+      "start_inclusive": true,
+      "end_inclusive": false
+    }
+  ],
+  "issued_at": "2026-10-01T11:55:00Z",
+  "cancelled_at": null
+}
+```
+
+窗口内当前没有任何安全出发时刻时返回 **422** `unsafe_trajectory`，
+承诺不落库；窗口起点不晚于签发时刻、相对轨迹/窗口非法时返回 **422**
+`invalid_trajectory` / `invalid_input`。
+
+查询与取消：
+
+```bash
+curl http://localhost:8000/api/commitments/1                 # 当前可用区间；未知 ID 404
+curl -X POST http://localhost:8000/api/commitments/1/cancel  # 取消，幂等
+```
+
+`GET` 返回的 `intervals` 是**查询时刻**的可用区间（按当前区域集合与
+当前时刻重算；已流逝的窗口部分与已结束窗口返回空区间）；取消响应的
+`intervals` 恒为空。
+
+区域变更抹掉承诺窗口结束前全部安全时刻的冲突响应（单区登记/修订/删除
+与批量变更一致）为 **409** `commitment_conflict`，details 逐条列出冲突
+承诺，整笔回滚：
+
+```json
+{
+  "error": {
+    "code": "commitment_conflict",
+    "message": "变更后区域集合与 1 张未取消择时通行承诺冲突，其窗口结束前将不再有任何安全出发时刻，整笔变更已回滚",
+    "details": [
+      {"commitment_id": 1, "message": "承诺 1（未取消且窗口未结束）在变更前仍有未来安全出发时刻，变更后窗口结束前将不再有任何安全出发时刻"}
+    ]
+  }
+}
+```
+
 ### 出发时刻调度 `POST /api/schedule`
 
 请求：固定行程用相对首点的秒数（首点 `t=0`、严格递增），候选时段带时区：
@@ -545,6 +688,8 @@ revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。�
 `duplicate_region`、`invalid_operation`、`unsafe_trajectory`（均 422）；
 凭证相关另用 `pass_conflict`（409，区域变更危及未取消凭证）与
 `not_found`（404，未知凭证 ID）；
+择时承诺另用 `commitment_conflict`（409，区域变更抹掉未结束承诺窗口内的
+全部安全出发时刻）与 `not_found`（404，未知承诺 ID）；
 幂等键相关另用 `invalid_idempotency_key`（422，键为空或超过 128 字符）与
 `idempotency_key_conflict`（409，同键被内容不同的请求复用）：
 
@@ -571,6 +716,10 @@ bash examples/curl_batch.sh
 # 通行凭证（签发/查询/取消；含 409 pass_conflict 约束、幂等取消、
 # 不安全与已开始轨迹拒签）
 bash examples/curl_passes.sh
+
+# 择时通行承诺（签发/查询当前区间/取消；含 409 commitment_conflict 约束、
+# 幂等取消、无安全时刻与窗口起点已过拒签）
+bash examples/curl_commitments.sh
 
 # 幂等重试（Idempotency-Key：同键重试回放原响应、同键不同内容 409、
 # 非法键 422、失败不占键、带键删除/批量重试）
@@ -601,6 +750,11 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 签发与区域写入并发串行化，会清空 regions/passes 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_passes_api.py
 
+# 择时通行承诺 API 集成测试（签发/查询/取消、承诺约束区域变更的
+# 「变更前有、变更后没有」语义、窗口结束放行、左闭右开端点、
+# 签发与区域写入并发串行化，会清空 regions/commitments 表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_commitments_api.py
+
 # 幂等键 API 集成测试（同键重试回放原响应、并发同键只提交一次、
 # 同键不同内容 409、非法键 422、失败不占键，会清空 regions/passes/idempotency_keys 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_idempotency_api.py
@@ -610,12 +764,12 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、幂等键）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、幂等键）
   schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证签发/取消、幂等键占位/回放
-  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/idempotency_keys）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/通行凭证/幂等键集成测试
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺签发与取消、区域写入前的凭证与承诺保护、幂等键占位/回放
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/idempotency_keys）、启动重试
+examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```

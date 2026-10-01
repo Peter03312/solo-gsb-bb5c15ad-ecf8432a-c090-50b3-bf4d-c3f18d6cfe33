@@ -21,11 +21,15 @@ from .repository import (
     BatchRegionsNotFound,
     BatchRevisionConflict,
     BatchUnsafeTrajectories,
+    CommitmentConflict,
+    CommitmentUnsafe,
     IdempotencyKeyConflict,
     PassConflict,
     PassUnsafe,
 )
 from .schemas import (
+    CommitmentIssueRequest,
+    CommitmentOut,
     PassIssueRequest,
     PassOut,
     RegionBatchRequest,
@@ -55,8 +59,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.4.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
+    version="1.5.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -167,6 +171,37 @@ def _pass_row_to_out(row: dict) -> dict:
             }
             for p in row["trajectory"]
         ],
+        "issued_at": row["created_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
+
+
+def _commitment_intervals_to_out(intervals: list[dict]) -> list[dict]:
+    """把承诺安全区间（epoch 秒）转成 API 输出（UTC datetime，左闭右开）。"""
+    return [
+        {
+            "start": datetime.fromtimestamp(iv["start"], tz=timezone.utc),
+            "end": datetime.fromtimestamp(iv["end"], tz=timezone.utc),
+            "start_inclusive": iv["start_inclusive"],
+            "end_inclusive": iv["end_inclusive"],
+        }
+        for iv in intervals
+    ]
+
+
+def _commitment_row_to_out(row: dict, intervals: list[dict]) -> dict:
+    """把 commitments 表行（trajectory 为相对秒数 JSONB）转成 API 输出。"""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "revision": row["issued_revision"],
+        "trajectory": [
+            {"x": p["x"], "y": p["y"], "t": p["t"]}
+            for p in row["trajectory"]
+        ],
+        "window_start": row["window_start"],
+        "window_end": row["window_end"],
+        "intervals": _commitment_intervals_to_out(intervals),
         "issued_at": row["created_at"],
         "cancelled_at": row["cancelled_at"],
     }
@@ -342,6 +377,29 @@ async def _on_pass_conflict(_request: Request, exc: PassConflict):
         [{"pass_id": pid,
           "message": f"凭证 {pid}（未取消且末点时刻未过）的轨迹在变更后区域集合下不再安全"}
          for pid in exc.pass_ids],
+    )
+
+
+@app.exception_handler(CommitmentUnsafe)
+async def _on_commitment_unsafe(_request: Request, exc: CommitmentUnsafe):
+    return _error_response(
+        422,
+        "unsafe_trajectory",
+        "候选出发窗口内当前不存在任何安全出发时刻，承诺拒签且不落库",
+        [],
+    )
+
+
+@app.exception_handler(CommitmentConflict)
+async def _on_commitment_conflict(_request: Request, exc: CommitmentConflict):
+    return _error_response(
+        409,
+        "commitment_conflict",
+        str(exc),
+        [{"commitment_id": cid,
+          "message": f"承诺 {cid}（未取消且窗口未结束）在变更前仍有未来安全出发时刻，"
+                     f"变更后窗口结束前将不再有任何安全出发时刻"}
+         for cid in exc.commitment_ids],
     )
 
 
@@ -712,6 +770,136 @@ def cancel_pass(pass_id: int = Path(ge=1)):
     return _pass_row_to_out(row)
 
 
+# ---------------------------------------------------------------- 择时通行承诺
+
+@app.post("/api/commitments", response_model=CommitmentOut, status_code=201,
+          responses={
+              422: {"description": "轨迹/窗口非法、窗口起点不晚于签发时刻，"
+                                   "或窗口内无任何安全出发时刻"},
+          },
+          tags=["commitments"])
+def issue_commitment(payload: CommitmentIssueRequest):
+    """为相对秒数固定行程申请择时通行承诺。
+
+    轨迹点用相对首点的秒数给出（首点必须为 0、其余严格递增）；候选出发
+    窗口 `[window_start, window_end)` 带时区，且**窗口起点必须晚于签发时刻**
+    （以服务端拿到写锁后的当前时间为准）。签发在持有全局元数据行锁的写
+    事务内完成：与取消及所有区域写入串行化，按**当前完整区域集合**用
+    `/api/schedule` 的同一精确区间运算求窗口内左闭右开的安全出发区间。
+
+    * 存在安全出发区间：持久化并返回 201，携带承诺 ID、签发时的区域
+      `revision` 与当前安全区间；签发不推进区域 revision；
+    * 区间为空：422 `unsafe_trajectory`，拒签且不落库；
+    * 轨迹/窗口非法或窗口起点不晚于当前时刻：422
+      `invalid_trajectory`/`invalid_input`，不落库。
+
+    未取消且窗口未结束的承诺会约束后续区域写入（见各区域写接口）：
+    区域单项变更与批量变更提交前，系统在同一写事务内以变更后的完整集合
+    重算当前时刻之后的安全区间；变更前仍有未来安全时刻而变更后没有时，
+    返回 409 `commitment_conflict`（details 列出冲突承诺 ID），整笔回滚；
+    变更前已无未来安全时刻的承诺不再约束。
+    """
+    # 相对轨迹合法性（点数、有限坐标、首点 0、严格递增）在几何层统一报错
+    traj = geometry.validate_relative_trajectory(
+        payload.points, lambda p: (p.x, p.y), lambda p: p.t
+    )
+    if payload.window_start >= payload.window_end:
+        raise DomainError(
+            "候选出发窗口必须满足 window_start < window_end（左闭右开，起早于止）",
+            ["window_start", "window_end"],
+        )
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.issue_commitment(
+                    cur, traj, payload.window_start, payload.window_end
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    intervals = row.pop("intervals")
+    return _commitment_row_to_out(row, intervals)
+
+
+def _active_commitment_view(cur, row: dict) -> dict:
+    """在当前事务内按当前区域集合重算承诺的可用安全区间。"""
+    revision, regions = repository.load_snapshot(cur)
+    now_epoch = repository.utcnow().timestamp()
+    intervals = repository.commitment_safe_intervals(
+        [
+            (float(p["t"]), float(p["x"]), float(p["y"]))
+            for p in row["trajectory"]
+        ],
+        regions,
+        row["window_start"].timestamp(),
+        row["window_end"].timestamp(),
+        now_epoch,
+    )
+    return _commitment_row_to_out(row, intervals)
+
+
+@app.get("/api/commitments/{commitment_id}", response_model=CommitmentOut,
+         tags=["commitments"])
+def get_commitment(commitment_id: int = Path(ge=1)):
+    """查询承诺及其**当前可用**安全出发区间（按当前区域集合与当前时刻重算）；
+    已取消承诺的 intervals 恒为空；未知 ID 返回 404。"""
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                row = repository.get_commitment(cur, commitment_id)
+                if row is None:
+                    view = None
+                elif row["status"] == "cancelled":
+                    view = _commitment_row_to_out(row, [])
+                else:
+                    view = _active_commitment_view(cur, row)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if view is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"承诺 {commitment_id} 不存在"}})
+    return view
+
+
+@app.post("/api/commitments/{commitment_id}/cancel", response_model=CommitmentOut,
+          tags=["commitments"])
+def cancel_commitment(commitment_id: int = Path(ge=1)):
+    """取消承诺并返回状态；重复取消幂等（结果不变），未知 ID 返回 404。
+
+    取消与签发、所有区域写入在同一把全局元数据行锁上串行化；取消不推进
+    区域 revision。取消后承诺不再约束任何区域变更，响应 intervals 恒为空。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_commitment(cur, commitment_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if row is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"承诺 {commitment_id} 不存在"}})
+    return _commitment_row_to_out(row, [])
+
+
 # ---------------------------------------------------------------- 轨迹核验
 
 @app.post("/api/verify", response_model=VerifyResponse, tags=["verification"])
@@ -834,6 +1022,8 @@ def root():
             "GET /api/revision", "POST /api/verify", "POST /api/schedule",
             "POST /api/passes", "GET /api/passes/{id}",
             "POST /api/passes/{id}/cancel",
+            "POST /api/commitments", "GET /api/commitments/{id}",
+            "POST /api/commitments/{id}/cancel",
             "GET /health",
         ],
     }
